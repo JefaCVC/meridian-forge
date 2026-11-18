@@ -1,8 +1,8 @@
 # Meridian Forge
 
-[![make.fun](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/competitions/github-core-clone-01)
-[![repo rank](https://make.fun/badge/github-core-clone-01/rank.svg)](https://make.fun/competitions/github-core-clone-01)
-[![reward](https://make.fun/badge/github-core-clone-01/reward.svg)](https://make.fun/competitions/github-core-clone-01)
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/JefaCVC/meridian-forge/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/JefaCVC/meridian-forge/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
 A GitHub-compatible git forge in a single process: smart-HTTP git
 (upload-pack protocol v2, receive-pack v0), REST v3, GraphQL v4, and an MCP
