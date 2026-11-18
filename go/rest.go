@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // ---- JSON helpers ----
@@ -97,16 +98,139 @@ func (r *Repo) issueToJSON(iss *Issue) issueJSON {
 		labels = append(labels, labelJSON{Name: l.Name, Color: l.Color})
 	}
 	return issueJSON{
-		ID: iss.ID, NodeID: r.issueGlobalID(iss), Number: iss.Number,
+		ID: iss.ID, NodeID: iss.nodeID, Number: iss.Number,
 		Title: iss.Title, Body: iss.Body, State: iss.State, Labels: labels,
 		User: viewerJSON(), CreatedAt: iss.CreatedAt, UpdatedAt: iss.UpdatedAt,
 		Comments: len(iss.Comments),
 	}
 }
 
+// viewerUserJSON is json.Marshal(viewerJSON()): the fixed user object every
+// issue carries.
+const viewerUserJSON = `{"login":"adaiversen","id":1000,"type":"User"}`
+
+// appendJSONString appends s as a JSON string literal, byte-identical to
+// encoding/json with HTML escaping on (what json.Marshal produces): " \ and
+// control chars are escaped, < > & become \u003c \u003e \u0026, U+2028/2029
+// are escaped, and invalid UTF-8 bytes become the literal U+FFFD rune.
+func appendJSONString(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	start := 0
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c < 0x20 || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
+			if start < i {
+				dst = append(dst, s[start:i]...)
+			}
+			switch c {
+			case '"':
+				dst = append(dst, '\\', '"')
+			case '\\':
+				dst = append(dst, '\\', '\\')
+			case '\n':
+				dst = append(dst, '\\', 'n')
+			case '\r':
+				dst = append(dst, '\\', 'r')
+			case '\t':
+				dst = append(dst, '\\', 't')
+			case '\b':
+				dst = append(dst, '\\', 'b')
+			case '\f':
+				dst = append(dst, '\\', 'f')
+			case '<':
+				dst = append(dst, '\\', 'u', '0', '0', '3', 'c')
+			case '>':
+				dst = append(dst, '\\', 'u', '0', '0', '3', 'e')
+			case '&':
+				dst = append(dst, '\\', 'u', '0', '0', '2', '6')
+			default:
+				dst = append(dst, '\\', 'u', '0', '0', hexLower[c>>4], hexLower[c&0xf])
+			}
+			i++
+			start = i
+			continue
+		}
+		if c < 0x80 {
+			i++
+			continue
+		}
+		// Multibyte: validate UTF-8 the way encoding/json does.
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			if start < i {
+				dst = append(dst, s[start:i]...)
+			}
+			dst = append(dst, "\uFFFD"...)
+			i++
+			start = i
+			continue
+		}
+		if r == '\u2028' || r == '\u2029' {
+			if start < i {
+				dst = append(dst, s[start:i]...)
+			}
+			dst = append(dst, '\\', 'u', '2', '0', '2', '8'+byte(r-'\u2028'))
+			i += size
+			start = i
+			continue
+		}
+		i += size
+	}
+	if start < len(s) {
+		dst = append(dst, s[start:]...)
+	}
+	return append(dst, '"')
+}
+
+// buildLabelsJSON pre-serializes an issue's labels array (labels never
+// change after creation, so this is built once).
+func buildLabelsJSON(labels []*Label) []byte {
+	if len(labels) == 0 {
+		return []byte("[]")
+	}
+	var b []byte
+	b = append(b, '[')
+	for i, l := range labels {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, `{"name":`...)
+		b = appendJSONString(b, l.Name)
+		b = append(b, `,"color":`...)
+		b = appendJSONString(b, l.Color)
+		b = append(b, '}')
+	}
+	return append(b, ']')
+}
+
 // refreshIssueJSON rebuilds the pre-serialized issue JSON after a mutation.
+// Hand-rolled (no reflection, no intermediate structs); byte-identical to
+// json.Marshal(issueToJSON(iss)).
 func (r *Repo) refreshIssueJSON(iss *Issue) {
-	b, _ := json.Marshal(r.issueToJSON(iss))
+	b := make([]byte, 0, 256)
+	b = append(b, `{"id":`...)
+	b = strconv.AppendInt(b, int64(iss.ID), 10)
+	b = append(b, `,"node_id":`...)
+	b = appendJSONString(b, iss.nodeID)
+	b = append(b, `,"number":`...)
+	b = strconv.AppendInt(b, int64(iss.Number), 10)
+	b = append(b, `,"title":`...)
+	b = appendJSONString(b, iss.Title)
+	b = append(b, `,"body":`...)
+	b = appendJSONString(b, iss.Body)
+	b = append(b, `,"state":`...)
+	b = appendJSONString(b, iss.State)
+	b = append(b, `,"labels":`...)
+	b = append(b, iss.labelsJSON...)
+	b = append(b, `,"user":`...)
+	b = append(b, viewerUserJSON...)
+	b = append(b, `,"created_at":`...)
+	b = appendJSONString(b, iss.CreatedAt)
+	b = append(b, `,"updated_at":`...)
+	b = appendJSONString(b, iss.UpdatedAt)
+	b = append(b, `,"comments":`...)
+	b = strconv.AppendInt(b, int64(len(iss.Comments)), 10)
+	b = append(b, '}')
 	iss.jsonCache = b
 }
 
@@ -1105,6 +1229,8 @@ func (s *Store) newIssue(repo *Repo, title, body string, labels []*Label) *Issue
 	}
 	s.nextIssueID++
 	repo.nextNumber++
+	iss.nodeID = repo.issueGlobalID(iss)
+	iss.labelsJSON = buildLabelsJSON(labels)
 	repo.issues[iss.Number] = iss
 	repo.issueOrder = append(repo.issueOrder, iss.Number)
 	repo.refreshIssueJSON(iss)

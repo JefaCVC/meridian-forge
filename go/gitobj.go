@@ -18,7 +18,81 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 )
+
+// Pooled zlib readers/writers. A fresh flate reader/writer allocates large
+// window + table state per object (the push workload inflates 3 objects per
+// push, the clone workload deflates 3 per cold fetch); reusing them via
+// Reset removes the biggest per-request allocation churn in the hot paths.
+var zlibReaderPool sync.Pool // io.ReadCloser from zlib.NewReader, fully consumed (EOF) before pooling
+var zlibWriterPool sync.Pool // *zlib.Writer at flate.BestSpeed, closed before pooling
+
+// zlibReaderResetter is the Reset method of zlib's unexported reader type.
+type zlibReaderResetter interface {
+	io.ReadCloser
+	Reset(r io.Reader, dict []byte) error
+}
+
+func getZlibReader(br *bytes.Reader) (io.ReadCloser, error) {
+	if v := zlibReaderPool.Get(); v != nil {
+		zr := v.(io.ReadCloser)
+		if rs, ok := zr.(zlibReaderResetter); ok {
+			if err := rs.Reset(br, nil); err == nil {
+				return zr, nil
+			}
+		}
+		// Reset failed: the reader is unusable, drop it and make a fresh one.
+	}
+	return zlib.NewReader(br)
+}
+
+func getZlibWriter(w io.Writer) *zlib.Writer {
+	if v := zlibWriterPool.Get(); v != nil {
+		zw := v.(*zlib.Writer)
+		zw.Reset(w)
+		return zw
+	}
+	zw, _ := zlib.NewWriterLevel(w, flate.BestSpeed)
+	return zw
+}
+
+// maxInflateExact is the largest single-object inflate done with an
+// exactly-sized buffer; bigger claims fall back to io.ReadAll so a corrupt
+// size varint cannot force a giant allocation. Suite packs are < 1 MiB.
+const maxInflateExact = 16 << 20
+
+// inflateExact inflates exactly size bytes from zr, verifying the stream ends
+// there (extra output is a size mismatch, a short stream is an error) and
+// that the zlib checksum verifies. Equivalent to io.ReadAll + a length check,
+// but with a single exactly-sized allocation.
+func inflateExact(zr io.Reader, size uint64) ([]byte, error) {
+	if size > maxInflateExact {
+		data, err := io.ReadAll(zr)
+		if err != nil {
+			return nil, fmt.Errorf("inflate failed: %w", err)
+		}
+		if uint64(len(data)) != size {
+			return nil, fmt.Errorf("inflated size mismatch: got %d want %d", len(data), size)
+		}
+		return data, nil
+	}
+	data := make([]byte, size)
+	if _, err := io.ReadFull(zr, data); err != nil {
+		return nil, fmt.Errorf("inflate failed: %w", err)
+	}
+	// One more read forces the stream to EOF (consuming + verifying the
+	// adler32) and proves there is no extra output.
+	var extra [1]byte
+	n, err := zr.Read(extra[:])
+	if n > 0 {
+		return nil, fmt.Errorf("inflated size mismatch: got more than %d", size)
+	}
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("inflate failed: %w", err)
+	}
+	return data, nil
+}
 
 // ---- commit / tree / tag parsing ----
 
@@ -298,21 +372,19 @@ func readPack(pack []byte, resolve func(oid string) *Object) (map[string]*Object
 		// Inflate the zlib stream. flate does not over-read when the reader
 		// implements io.ByteReader (bytes.Reader does), so the reader's
 		// position after the stream is exact — one pass gives both the data
-		// and the consumed length.
+		// and the consumed length. The reader is pooled (Reset) and the
+		// output buffer is exactly sized from the pack header.
 		br := bytes.NewReader(pack[off:end])
-		zr, err := zlib.NewReader(br)
+		zr, err := getZlibReader(br)
 		if err != nil {
 			return nil, fmt.Errorf("bad zlib stream: %w", err)
 		}
-		data, err := io.ReadAll(zr)
-		zr.Close()
+		data, err := inflateExact(zr, size)
 		if err != nil {
-			return nil, fmt.Errorf("inflate failed: %w", err)
+			return nil, err
 		}
+		zlibReaderPool.Put(zr)
 		off += (len(pack) - 20 - off) - br.Len()
-		if uint64(len(data)) != size {
-			return nil, fmt.Errorf("inflated size mismatch: got %d want %d", len(data), size)
-		}
 		entries = append(entries, pending{typ: typ, data: data, ofsBase: ofsBase, refBase: refBase, offset: entryOff})
 	}
 
@@ -360,6 +432,10 @@ func readPack(pack []byte, resolve func(oid string) *Object) (map[string]*Object
 
 // writePack serializes objects into a PACK v2 stream (no deltas), sorted by
 // oid for determinism. objects maps oid -> object.
+//
+// The zlib writers are pooled (a fresh flate writer allocates ~100 KiB of
+// window/table state) and each entry is deflated straight into the output
+// buffer + the running trailer hash, with no per-entry buffer or copy.
 func writePack(objects map[string]*Object) []byte {
 	oids := make([]string, 0, len(objects))
 	for oid := range objects {
@@ -377,31 +453,35 @@ func writePack(objects map[string]*Object) []byte {
 	binary.BigEndian.PutUint32(hdr[8:12], uint32(len(oids)))
 	buf.Write(hdr)
 	h.Write(hdr)
+	out := io.MultiWriter(&buf, h)
+	var varint [10]byte
 	for _, oid := range oids {
 		obj := objects[oid]
-		var entry bytes.Buffer
 		// type+size varint
 		size := uint64(len(obj.Data))
 		first := byte((obj.Type << 4) | byte(size&0x0f))
 		size >>= 4
+		n := 0
 		if size > 0 {
 			first |= 0x80
 		}
-		entry.WriteByte(first)
+		varint[n] = first
+		n++
 		for size > 0 {
 			b := byte(size & 0x7f)
 			size >>= 7
 			if size > 0 {
 				b |= 0x80
 			}
-			entry.WriteByte(b)
+			varint[n] = b
+			n++
 		}
+		out.Write(varint[:n])
 		// zlib stream, best-speed deflate (packs here are small; latency wins)
-		zw, _ := zlib.NewWriterLevel(&entry, flate.BestSpeed)
+		zw := getZlibWriter(out)
 		zw.Write(obj.Data)
 		zw.Close()
-		buf.Write(entry.Bytes())
-		h.Write(entry.Bytes())
+		zlibWriterPool.Put(zw)
 	}
 	// trailer: sha1 of everything before it
 	buf.Write(h.Sum(nil))

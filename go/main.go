@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -52,7 +54,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	switch {
 	case path == "/api/v3" || strings.HasPrefix(path, "/api/v3/"):
-		s.handleREST(w, r)
+		if !s.tryIssueFastPath(w, r) {
+			s.handleREST(w, r)
+		}
 	case path == "/api/graphql":
 		s.handleGraphQL(w, r)
 	case path == "/mcp":
@@ -64,21 +68,92 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// tryIssueFastPath serves the benchmark read/write hot paths — GET
+// /api/v3/repos/{owner}/{repo}/issues/{number} and POST
+// /api/v3/repos/{owner}/{repo}/issues — with index-scan parsing instead of
+// the generic router's Split chain. Anything that does not match the pattern
+// exactly (odd numbers, extra segments, other methods) returns false and the
+// generic router handles it, so behaviour is identical.
+func (s *Server) tryIssueFastPath(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		return false
+	}
+	p := r.URL.Path
+	if !strings.HasPrefix(p, "/api/v3/repos/") {
+		return false
+	}
+	rest := p[len("/api/v3/repos/"):]
+	i := strings.IndexByte(rest, '/')
+	if i < 0 {
+		return false
+	}
+	owner := rest[:i]
+	rest = rest[i+1:]
+	j := strings.IndexByte(rest, '/')
+	if j < 0 {
+		return false
+	}
+	name := rest[:j]
+	rest = rest[j+1:]
+	if owner != viewerLogin {
+		return false // generic router answers 404
+	}
+	if rest == "issues" {
+		if r.Method != http.MethodPost {
+			return false // GET list goes through the generic router
+		}
+		s.createIssue(w, r, owner, name)
+		return true
+	}
+	if !strings.HasPrefix(rest, "issues/") {
+		return false
+	}
+	numStr := rest[len("issues/"):]
+	if numStr == "" || r.Method != http.MethodGet {
+		return false
+	}
+	num := 0
+	for k := 0; k < len(numStr); k++ {
+		c := numStr[k]
+		if c < '0' || c > '9' {
+			return false // non-numeric: generic router answers 404
+		}
+		num = num*10 + int(c-'0')
+		if num > 1<<30 {
+			return false // overflow guard: generic router answers 404
+		}
+	}
+	s.getIssue(w, r, owner, name, num)
+	return true
+}
+
 // ---- git smart-HTTP routes ----
 
 // tryGitRoute handles /{owner}/{repo}.git/{info/refs,git-upload-pack,git-receive-pack}.
-// Returns false when the path is not a git route.
+// Returns false when the path is not a git route. Parsed with index scans
+// (no Split/Join allocations) — every push and clone hits this twice.
 func (s *Server) tryGitRoute(w http.ResponseWriter, r *http.Request) bool {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
-	if len(parts) < 3 {
+	p := r.URL.Path
+	if len(p) < 2 || p[0] != '/' {
 		return false
 	}
-	owner := parts[0]
-	if !strings.HasSuffix(parts[1], ".git") {
+	rest := p[1:]
+	i := strings.IndexByte(rest, '/')
+	if i < 0 {
 		return false
 	}
-	repoName := strings.TrimSuffix(parts[1], ".git")
-	service := strings.Join(parts[2:], "/")
+	owner := rest[:i]
+	rest = rest[i+1:]
+	j := strings.IndexByte(rest, '/')
+	if j < 0 {
+		return false
+	}
+	repoPart := rest[:j]
+	service := rest[j+1:]
+	if !strings.HasSuffix(repoPart, ".git") {
+		return false
+	}
+	repoName := repoPart[:len(repoPart)-4]
 	if owner != viewerLogin {
 		writeErr(w, http.StatusNotFound, "Not Found")
 		return true
@@ -109,7 +184,17 @@ func (s *Server) tryGitRoute(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, owner, repoName string) {
-	service := r.URL.Query().Get("service")
+	// Fast path: the only query the suite sends is a bare service= param.
+	// Anything else falls back to full query parsing.
+	var service string
+	switch r.URL.RawQuery {
+	case "service=git-upload-pack":
+		service = "git-upload-pack"
+	case "service=git-receive-pack":
+		service = "git-receive-pack"
+	default:
+		service = r.URL.Query().Get("service")
+	}
 	if service != "git-upload-pack" && service != "git-receive-pack" {
 		writeErr(w, http.StatusNotFound, "Not Found")
 		return
@@ -164,10 +249,11 @@ func (s *Server) handleUploadPack(w http.ResponseWriter, r *http.Request, owner,
 		writeErr(w, http.StatusBadRequest, "cannot read request body")
 		return
 	}
-	// v2 if the header says so or the first line is a command=
+	// v2 if the header says so or the first line is a command= (peek at the
+	// first pkt-line directly instead of parsing the whole body).
 	isV2 := r.Header.Get("Git-Protocol") == "version=2"
-	if !isV2 && len(body) >= 4 {
-		if pkts, _ := parsePktLines(body); len(pkts) > 0 && pkts[0].kind == "data" && strings.HasPrefix(pkts[0].text, "command=") {
+	if !isV2 && len(body) >= 12 {
+		if n, ok := parseHex4(body[:4]); ok && n >= 12 && len(body) >= n && bytes.HasPrefix(body[4:n], commandPrefix) {
 			isV2 = true
 		}
 	}
@@ -211,7 +297,7 @@ func (s *Server) handleUploadPackV2(w http.ResponseWriter, body []byte, repo *Re
 				a.prefixes = append(a.prefixes, strings.TrimPrefix(arg, "ref-prefix "))
 			}
 		}
-		key := "ls:" + strings.Join(a.prefixes, ",") + fmt.Sprintf("|%v%v%v", a.peel, a.symrefs, a.unborn)
+		key := "ls:" + strings.Join(a.prefixes, ",") + "|" + boolByte(a.peel) + boolByte(a.symrefs) + boolByte(a.unborn)
 		if c, ok := repo.lsCache[key]; ok && c.gen == repo.gen {
 			resp := c.body
 			s.store.mu.RUnlock()
@@ -325,6 +411,15 @@ func parseFetchArgs(args []string) fetchRequest {
 	return req
 }
 
+var commandPrefix = []byte("command=")
+
+func boolByte(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
+}
+
 func fetchCacheKey(prefix string, req fetchRequest) string {
 	var b strings.Builder
 	b.WriteString(prefix)
@@ -360,27 +455,28 @@ func parseAllPktLines(b []byte) []pkt {
 	var out []pkt
 	off := 0
 	for off+4 <= len(b) {
-		if string(b[off:off+4]) == "0000" {
-			out = append(out, pkt{kind: "flush"})
-			off += 4
-			continue
+		if b[off] == '0' && b[off+1] == '0' && b[off+2] == '0' {
+			switch b[off+3] {
+			case '0':
+				out = append(out, pkt{kind: "flush"})
+				off += 4
+				continue
+			case '1':
+				out = append(out, pkt{kind: "delim"})
+				off += 4
+				continue
+			case '2':
+				out = append(out, pkt{kind: "end"})
+				off += 4
+				continue
+			}
 		}
-		if string(b[off:off+4]) == "0001" {
-			out = append(out, pkt{kind: "delim"})
-			off += 4
-			continue
-		}
-		if string(b[off:off+4]) == "0002" {
-			out = append(out, pkt{kind: "end"})
-			off += 4
-			continue
-		}
-		n, err := strconv.ParseInt(string(b[off:off+4]), 16, 32)
-		if err != nil || n < 4 || off+int(n) > len(b) {
+		n, ok := parseHex4(b[off : off+4])
+		if !ok || n < 4 || off+n > len(b) {
 			break
 		}
-		out = append(out, pkt{kind: "data", text: string(b[off+4 : off+int(n)])})
-		off += int(n)
+		out = append(out, pkt{kind: "data", text: string(b[off+4 : off+n])})
+		off += n
 	}
 	return out
 }
@@ -430,10 +526,17 @@ func (s *Server) handleReceivePack(w http.ResponseWriter, r *http.Request, owner
 	var out bytes.Buffer
 	if useSideband {
 		// one sideband packet per report line (each packet is a whole line)
+		var hdr [4]byte
 		for _, line := range report {
-			payload := append([]byte{1}, []byte(line+"\n")...)
-			out.WriteString(fmt.Sprintf("%04x", len(payload)+4))
-			out.Write(payload)
+			total := len(line) + 6 // 4 length + 1 band + line + \n
+			hdr[0] = hexLower[(total>>12)&0xf]
+			hdr[1] = hexLower[(total>>8)&0xf]
+			hdr[2] = hexLower[(total>>4)&0xf]
+			hdr[3] = hexLower[total&0xf]
+			out.Write(hdr[:])
+			out.WriteByte(1)
+			out.WriteString(line)
+			out.WriteByte('\n')
 		}
 	} else {
 		for _, line := range report {
@@ -460,6 +563,15 @@ func parseClockBase() int64 {
 }
 
 func main() {
+	// The live set is a few MiB of in-memory state; let the heap grow 3x
+	// before a GC cycle instead of 2x — fewer collections on the hot paths
+	// for a few MiB of headroom (the trial allows 1024 MiB).
+	debug.SetGCPercent(200)
+	// The trial grants the entry 2 CPUs, but Go 1.24's default GOMAXPROCS
+	// is the host's CPU count (gVisor reports the whole node). Capping the
+	// scheduler at the cgroup limit avoids thread thrash and GC-worker spam
+	// on a throttled 2-CPU container.
+	runtime.GOMAXPROCS(2)
 	token := os.Getenv("MAKEFUN_SHOP_TOKEN")
 	store := NewStore(parseClockBase())
 	srv := &Server{store: store, token: token}
@@ -476,18 +588,14 @@ func main() {
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	httpSrv := &http.Server{Handler: srv}
-
 	envURL := os.Getenv("MAKEFUN_ENV_URL")
 	if envURL == "" {
 		// Standalone mode (local testing): serve until killed.
 		fmt.Fprintf(os.Stderr, "meridian-forge: listening on port %d (standalone)\n", port)
 		fmt.Printf("meridian-forge listening on http://127.0.0.1:%d\n", port)
-		go func() {
-			_ = httpSrv.Serve(ln)
-		}()
+		go rawServe(ln, srv)
 		waitForSignal()
-		_ = httpSrv.Close()
+		_ = ln.Close()
 		return
 	}
 
@@ -496,12 +604,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "meridian-forge: register:", err)
 		os.Exit(1)
 	}
-	go func() {
-		_ = httpSrv.Serve(ln)
-	}()
+	go rawServe(ln, srv)
 	fmt.Fprintf(os.Stderr, "meridian-forge: registered port %d, polling done\n", port)
 	pollDone(envURL)
-	_ = httpSrv.Close()
+	_ = ln.Close()
 	os.Exit(0)
 }
 

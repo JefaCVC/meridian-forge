@@ -9,9 +9,7 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -19,15 +17,46 @@ const zeroOID = "0000000000000000000000000000000000000000"
 
 // ---- pkt-line framing ----
 
+const hexLower = "0123456789abcdef"
+
+// pktLenPrefix writes a 4-hex-digit pkt-line length prefix for n into b.
+func pktLenPrefix(b []byte, n int) []byte {
+	return append(b, hexLower[(n>>12)&0xf], hexLower[(n>>8)&0xf], hexLower[(n>>4)&0xf], hexLower[n&0xf])
+}
+
 func pktLine(s string) []byte {
 	n := len(s) + 4
-	out := make([]byte, 0, n)
-	out = append(out, []byte(fmt.Sprintf("%04x", n))...)
-	out = append(out, s...)
+	out := make([]byte, n)
+	out[0] = hexLower[(n>>12)&0xf]
+	out[1] = hexLower[(n>>8)&0xf]
+	out[2] = hexLower[(n>>4)&0xf]
+	out[3] = hexLower[n&0xf]
+	copy(out[4:], s)
 	return out
 }
 
 func pktFlush() []byte { return []byte("0000") }
+
+// parseHex4 parses 4 lowercase/uppercase hex digits (a pkt-line length).
+func parseHex4(b []byte) (int, bool) {
+	n := 0
+	for i := 0; i < 4; i++ {
+		c := b[i]
+		var v int
+		switch {
+		case c >= '0' && c <= '9':
+			v = int(c - '0')
+		case c >= 'a' && c <= 'f':
+			v = int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			v = int(c-'A') + 10
+		default:
+			return 0, false
+		}
+		n = n*16 + v
+	}
+	return n, true
+}
 
 // pkt is one parsed pkt-line: kind is "data", "flush", "delim" or "end".
 type pkt struct {
@@ -42,27 +71,28 @@ func parsePktLines(b []byte) ([]pkt, int) {
 	var out []pkt
 	off := 0
 	for off+4 <= len(b) {
-		if string(b[off:off+4]) == "0000" {
-			out = append(out, pkt{kind: "flush"})
-			off += 4
-			return out, off
+		if b[off] == '0' && b[off+1] == '0' && b[off+2] == '0' {
+			switch b[off+3] {
+			case '0':
+				out = append(out, pkt{kind: "flush"})
+				off += 4
+				return out, off
+			case '1':
+				out = append(out, pkt{kind: "delim"})
+				off += 4
+				continue
+			case '2':
+				out = append(out, pkt{kind: "end"})
+				off += 4
+				continue
+			}
 		}
-		if string(b[off:off+4]) == "0001" {
-			out = append(out, pkt{kind: "delim"})
-			off += 4
-			continue
-		}
-		if string(b[off:off+4]) == "0002" {
-			out = append(out, pkt{kind: "end"})
-			off += 4
-			continue
-		}
-		n, err := strconv.ParseInt(string(b[off:off+4]), 16, 32)
-		if err != nil || n < 4 || off+int(n) > len(b) {
+		n, ok := parseHex4(b[off : off+4])
+		if !ok || n < 4 || off+n > len(b) {
 			return out, len(b) // malformed: stop, caller decides
 		}
-		out = append(out, pkt{kind: "data", text: string(b[off+4 : off+int(n)])})
-		off += int(n)
+		out = append(out, pkt{kind: "data", text: string(b[off+4 : off+n])})
+		off += n
 	}
 	return out, off
 }
@@ -71,6 +101,7 @@ func parsePktLines(b []byte) ([]pkt, int) {
 func sidebandPackets(pack []byte) []byte {
 	var out bytes.Buffer
 	const maxData = 65515 // 65516 payload - 1 band byte
+	var hdr [4]byte
 	for len(pack) > 0 {
 		n := len(pack)
 		if n > maxData {
@@ -78,11 +109,15 @@ func sidebandPackets(pack []byte) []byte {
 		}
 		chunk := pack[:n]
 		pack = pack[n:]
-		payload := make([]byte, 0, len(chunk)+1)
-		payload = append(payload, 1)
-		payload = append(payload, chunk...)
-		out.WriteString(fmt.Sprintf("%04x", len(payload)+4))
-		out.Write(payload)
+		// length prefix covers the 4 length bytes + band byte + chunk
+		total := len(chunk) + 5
+		hdr[0] = hexLower[(total>>12)&0xf]
+		hdr[1] = hexLower[(total>>8)&0xf]
+		hdr[2] = hexLower[(total>>4)&0xf]
+		hdr[3] = hexLower[total&0xf]
+		out.Write(hdr[:])
+		out.WriteByte(1)
+		out.Write(chunk)
 	}
 	return out.Bytes()
 }
@@ -495,9 +530,9 @@ func (r *Repo) receivePack(cmds []pushCommand, pack []byte, resolveMissing func(
 			}
 			return report, false, err.Error()
 		}
+		// readPack already hashed every object; store by its oid directly.
 		for oid, obj := range objects {
-			_ = oid
-			r.putObject(obj.Type, obj.Data)
+			r.putObjectWithOID(oid, obj.Type, obj.Data)
 		}
 	}
 	report = append(report, "unpack ok")

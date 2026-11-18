@@ -94,19 +94,23 @@ type Label struct {
 }
 
 // Issue is one issue. JSON is pre-serialized at creation/mutation and served
-// verbatim on the read hot path.
+// verbatim on the read hot path. nodeID and labelsJSON are immutable after
+// creation (labels never change), so the refresh only rebuilds the mutable
+// fields around them.
 type Issue struct {
-	ID        int
-	Number    int
-	Title     string
-	Body      string
-	State     string // "open" | "closed"
-	Labels    []*Label
-	CreatedAt string
-	UpdatedAt string
+	ID         int
+	Number     int
+	Title      string
+	Body       string
+	State      string // "open" | "closed"
+	Labels     []*Label
+	CreatedAt  string
+	UpdatedAt  string
 	CreatedSeq int64
-	Comments  []*Comment
-	jsonCache []byte
+	Comments   []*Comment
+	nodeID     string
+	labelsJSON []byte
+	jsonCache  []byte
 }
 
 // Comment is one issue comment.
@@ -282,7 +286,59 @@ func (s *Store) nextTime() int64 {
 
 // nextTimeISO returns the next deterministic timestamp as RFC 3339 UTC.
 func (s *Store) nextTimeISO() string {
-	return time.Unix(s.nextTime(), 0).UTC().Format("2006-01-02T15:04:05Z")
+	return formatEpoch(s.nextTime())
+}
+
+// formatEpoch formats epoch seconds as RFC 3339 UTC ("2006-01-02T15:04:05Z")
+// with integer arithmetic instead of time.Time (the write hot path formats
+// one timestamp per issue create). Output is byte-identical to
+// time.Unix(sec, 0).UTC().Format("2006-01-02T15:04:05Z") for sec >= 0;
+// negative inputs fall back to time.Format.
+func formatEpoch(sec int64) string {
+	if sec < 0 {
+		return time.Unix(sec, 0).UTC().Format("2006-01-02T15:04:05Z")
+	}
+	days := sec / 86400
+	rem := sec % 86400
+	hour := rem / 3600
+	min := (rem % 3600) / 60
+	secOfMin := rem % 60
+	// Civil from days (Howard Hinnant's algorithm).
+	z := days + 719468
+	era := z / 146097
+	doe := z - era*146097 // [0, 146096]
+	yoe := (doe - doe/1460 + doe/36524 - doe/146096) / 365 // [0, 399]
+	y := yoe + era*400
+	doy := doe - (365*yoe + yoe/4 - yoe/100) // [0, 365]
+	mp := (5*doy + 2) / 153                   // [0, 11]
+	d := doy - (153*mp+2)/5 + 1               // [1, 31]
+	m := mp + 3
+	if mp >= 10 {
+		m = mp - 9
+		y++
+	}
+	var b [20]byte
+	b[0] = byte('0' + y/1000)
+	b[1] = byte('0' + (y/100)%10)
+	b[2] = byte('0' + (y/10)%10)
+	b[3] = byte('0' + y%10)
+	b[4] = '-'
+	b[5] = byte('0' + m/10)
+	b[6] = byte('0' + m%10)
+	b[7] = '-'
+	b[8] = byte('0' + d/10)
+	b[9] = byte('0' + d%10)
+	b[10] = 'T'
+	b[11] = byte('0' + hour/10)
+	b[12] = byte('0' + hour%10)
+	b[13] = ':'
+	b[14] = byte('0' + min/10)
+	b[15] = byte('0' + min%10)
+	b[16] = ':'
+	b[17] = byte('0' + secOfMin/10)
+	b[18] = byte('0' + secOfMin%10)
+	b[19] = 'Z'
+	return string(b[:])
 }
 
 // nextRequestID returns a deterministic request id for X-GitHub-Request-Id.
@@ -330,8 +386,16 @@ func (s *Store) deleteRepo(owner, name string) bool {
 // Caller must hold the write lock.
 func (r *Repo) putObject(typ byte, data []byte) string {
 	oid := hashObject(typ, data)
+	r.putObjectWithOID(oid, typ, data)
+	return oid
+}
+
+// putObjectWithOID stores an object whose oid is already known (readPack
+// hashes every object it returns, so the push path must not hash twice).
+// Caller must hold the write lock.
+func (r *Repo) putObjectWithOID(oid string, typ byte, data []byte) {
 	if _, ok := r.objects[oid]; ok {
-		return oid
+		return
 	}
 	r.objects[oid] = &Object{Type: typ, Data: data}
 	if typ == objCommit {
@@ -340,7 +404,6 @@ func (r *Repo) putObject(typ byte, data []byte) string {
 		r.commitParents[oid] = parents
 		r.commitMessage[oid] = msg
 	}
-	return oid
 }
 
 // isAncestor reports whether anc is reachable from oid (following parents),
