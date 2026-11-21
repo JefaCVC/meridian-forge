@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // maxRequestBody is the largest request body accepted (64 MiB); the suite's
@@ -33,6 +34,34 @@ const maxRequestBody = 64 << 20
 
 var bufioReaderPool = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 4096) }}
 var responseBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 2048); return &b }}
+var responseWriterPool = sync.Pool{New: func() any { return &rawResponseWriter{header: make(http.Header, 4)} }}
+var requestHeaderPool = sync.Pool{New: func() any { return make(http.Header, 8) }}
+
+// tuneTCPConn sets the per-socket options net/http sets (TCP_NODELAY) plus
+// TCP_QUICKACK. The trial runs entry and suite in separate containers over a
+// Docker network: if the client's request arrives in two small writes with
+// Nagle on, the server's delayed ACK (up to 40 ms) stalls the second write.
+// QUICKACK makes the server ACK request segments immediately. The kernel
+// clears quickack mode once an ACK is emitted, so quickackTCP re-arms it
+// after every request (one cheap setsockopt per request).
+func tuneTCPConn(conn net.Conn) {
+	tc, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tc.SetNoDelay(true)
+	quickackTCP(tc)
+}
+
+func quickackTCP(tc *net.TCPConn) {
+	raw, err := tc.SyscallConn()
+	if err != nil {
+		return
+	}
+	_ = raw.Control(func(fd uintptr) {
+		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK, 1)
+	})
+}
 
 // rawServe accepts connections on ln and serves handler on each, one
 // goroutine per connection, until ln is closed.
@@ -42,6 +71,7 @@ func rawServe(ln net.Listener, handler http.Handler) {
 		if err != nil {
 			return
 		}
+		tuneTCPConn(conn)
 		go serveRawConn(conn, handler)
 	}
 }
@@ -51,17 +81,33 @@ func serveRawConn(conn net.Conn, handler http.Handler) {
 	br := bufioReaderPool.Get().(*bufio.Reader)
 	br.Reset(conn)
 	defer bufioReaderPool.Put(br)
+	tc, _ := conn.(*net.TCPConn)
 	for {
 		req, closeAfter, err := readRawRequest(br, conn)
 		if err != nil {
 			return
 		}
-		rw := &rawResponseWriter{header: make(http.Header)}
-		handler.ServeHTTP(rw, req)
-		if !writeRawResponse(conn, req, rw) {
-			return
+		// Re-arm QUICKACK for the next request's arrival (the kernel
+		// clears it after emitting an ACK).
+		if tc != nil {
+			quickackTCP(tc)
 		}
-		if closeAfter {
+		rw := responseWriterPool.Get().(*rawResponseWriter)
+		handler.ServeHTTP(rw, req)
+		ok := writeRawResponse(conn, req, rw)
+		// Recycle the writer and the request header map (both are used
+		// only synchronously inside ServeHTTP).
+		hdr := req.Header
+		clear(hdr)
+		requestHeaderPool.Put(hdr)
+		clear(rw.header)
+		rw.status = 0
+		rw.wroteHeader = false
+		if cap(rw.body) <= 65536 {
+			rw.body = rw.body[:0]
+			responseWriterPool.Put(rw)
+		}
+		if !ok || closeAfter {
 			return
 		}
 	}
@@ -99,6 +145,66 @@ func trimLineEnd(b []byte) []byte {
 	return b
 }
 
+// parseRequestURI parses the request-target. Plain absolute paths with no
+// query, fragment or escapes (every hot-path URI) are built directly —
+// url.ParseRequestURI returns exactly {Path: uri} for those. Anything else
+// (query strings, escapes, absolute-form, non-printable bytes) falls back
+// to the full parser, so behaviour is identical.
+func parseRequestURI(uri string) (*url.URL, error) {
+	if len(uri) > 0 && uri[0] == '/' {
+		plain := true
+		for i := 0; i < len(uri); i++ {
+			c := uri[i]
+			if c < 0x21 || c > 0x7e || c == '?' || c == '%' || c == '#' {
+				plain = false
+				break
+			}
+		}
+		if plain {
+			// RawPath mirrors Path so EscapedPath/String match the stdlib
+			// (ParseRequestURI sets RawPath when the raw form differs from
+			// the default escaping, e.g. for '!' or '(' in a segment).
+			return &url.URL{Path: uri, RawPath: uri}, nil
+		}
+	}
+	return url.ParseRequestURI(uri)
+}
+
+// canonicalHeaderKey is textproto.CanonicalMIMEHeaderKey with a fast path
+// for the headers the suite sends (avoids one string allocation +
+// canonicalization per header). Unknown names fall back to the stdlib, so
+// the result is identical for every input.
+func canonicalHeaderKey(b []byte) string {
+	switch {
+	case bytes.EqualFold(b, []byte("host")):
+		return "Host"
+	case bytes.EqualFold(b, []byte("content-length")):
+		return "Content-Length"
+	case bytes.EqualFold(b, []byte("transfer-encoding")):
+		return "Transfer-Encoding"
+	case bytes.EqualFold(b, []byte("expect")):
+		return "Expect"
+	case bytes.EqualFold(b, []byte("connection")):
+		return "Connection"
+	case bytes.EqualFold(b, []byte("accept")):
+		return "Accept"
+	case bytes.EqualFold(b, []byte("authorization")):
+		return "Authorization"
+	case bytes.EqualFold(b, []byte("user-agent")):
+		return "User-Agent"
+	case bytes.EqualFold(b, []byte("content-type")):
+		return "Content-Type"
+	case bytes.EqualFold(b, []byte("git-protocol")):
+		return "Git-Protocol"
+	case bytes.EqualFold(b, []byte("accept-encoding")):
+		return "Accept-Encoding"
+	case bytes.EqualFold(b, []byte("cache-control")):
+		return "Cache-Control"
+	default:
+		return textproto.CanonicalMIMEHeaderKey(string(b))
+	}
+}
+
 // readRawRequest parses one HTTP/1.x request: request line, headers, body.
 // closeAfter reports whether the connection must close after the response
 // (HTTP/1.0 without keep-alive, or an explicit Connection: close).
@@ -129,13 +235,13 @@ func readRawRequest(br *bufio.Reader, conn net.Conn) (*http.Request, bool, error
 	} else if proto != "HTTP/1.1" {
 		return nil, false, errBadRequest
 	}
-	u, err := url.ParseRequestURI(uri)
+	u, err := parseRequestURI(uri)
 	if err != nil {
 		return nil, false, errBadRequest
 	}
 
-	// Headers.
-	header := make(http.Header)
+	// Headers (map pooled; serveRawConn recycles it after the response).
+	header := requestHeaderPool.Get().(http.Header)
 	var host string
 	var contentLength int64 = -1
 	chunked := false
@@ -154,7 +260,7 @@ func readRawRequest(br *bufio.Reader, conn net.Conn) (*http.Request, bool, error
 		if colon < 0 {
 			return nil, false, errBadRequest
 		}
-		name := textproto.CanonicalMIMEHeaderKey(string(h[:colon]))
+		name := canonicalHeaderKey(h[:colon])
 		value := strings.TrimLeft(string(h[colon+1:]), " \t")
 		header[name] = append(header[name], value)
 		switch name {
